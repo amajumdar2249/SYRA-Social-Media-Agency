@@ -35,3 +35,8 @@ credentials.json
 
 # Logs
 *.log
+logs/
+
+# Database
+*.db
+agency_data.db
