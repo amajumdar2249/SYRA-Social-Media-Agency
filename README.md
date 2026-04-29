@@ -111,7 +111,7 @@ python main.py
 
 ## 👤 Author
 
-**Aurgho Majumdar**  
+**The Builder**  
 Building an AI that thinks, writes, and delivers.
 
 ---

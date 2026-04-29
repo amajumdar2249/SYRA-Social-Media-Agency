@@ -2,7 +2,7 @@
 """
 Social Media Automation Pipeline v5.0
 ==========================================
-Aurgho Majumdar's Voice Engine — 4-Angle LinkedIn Post Generator.
+Voice Engine — 4-Angle LinkedIn Post Generator.
 Now with 2-Way Telegram Approval (Inline Buttons).
 
 Engine: OpenRouter (GPT-4o) -> DeepSeek -> Gemini (Fallback)
@@ -21,9 +21,9 @@ NICHE_KEYWORDS = [
 ]
 
 # ============================================================
-# AURGHO'S VOICE DNA (Calibrated from 12 sample posts)
+# VOICE DNA (Calibrated from 12 sample posts)
 # ============================================================
-VOICE = """You replicate Aurgho Majumdar's exact voice for LinkedIn.
+VOICE = """You replicate the founder's exact voice for LinkedIn.
 
 WHO HE IS:
 Early-stage builder. Doesn't fake success. Anti-fluff. Observational.
@@ -382,7 +382,7 @@ Context: {{CONTEXT}}
 Write ONLY the post. No labels, metadata, or explanations."""
 
 def generate_4_posts(title, summary):
-    """Generates 4 posts using Aurgho's calibrated framework."""
+    """Generates 4 posts using the calibrated voice framework."""
     posts = []
     templates = [
         ("INSIDER TRUTH", INSIDER_TRUTH_PROMPT),
