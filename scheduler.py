@@ -1,31 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Scheduler — Autonomous Pipeline Runner
-========================================
-Runs the full agency pipeline on a fixed schedule (default: every 4 hours).
-Designed for cloud deployment (GCP, Render, Railway, etc.)
+Hugging Face Web Server & Scheduler
+====================================
+Runs a FastAPI web server on port 7860 to satisfy Hugging Face Spaces requirements.
+Runs the autonomous agency pipeline in the background every 4 hours using APScheduler.
 
-Features:
-  - APScheduler with configurable interval
-  - Graceful shutdown on SIGTERM/SIGINT
-  - Health heartbeat logging
-  - Crash recovery (auto-restarts pipeline on failure)
-
-Run locally:  python scheduler.py
-Run on VM:    nohup python scheduler.py &
+Can be kept alive 24/7 for FREE using cron-job.org pinging the `/` route.
 """
 
 import os
 import sys
-import signal
 import time
+from contextlib import asynccontextmanager
 
-try:
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-except Exception:
-    pass
-
-from apscheduler.schedulers.blocking import BlockingScheduler
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.responses import HTMLResponse
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from agency.logger import get_logger
@@ -33,7 +23,7 @@ from agency.config import MIN_VIRALITY_SCORE, MAX_PER_FEED
 from agency.scraper import fetch_all_news
 from agency.generator import filter_and_score, generate_posts
 from agency.telegram import send_post, send_approval_buttons, wait_for_approval
-from agency.dedup import mark_processed, log_pipeline_run
+from agency.dedup import mark_processed, log_pipeline_run, get_stats
 from agency.llm_engine import get_engine_status
 
 log = get_logger("scheduler")
@@ -44,19 +34,19 @@ log = get_logger("scheduler")
 PIPELINE_INTERVAL_HOURS = int(os.getenv("PIPELINE_INTERVAL_HOURS", "4"))
 APPROVAL_TIMEOUT_MIN = int(os.getenv("APPROVAL_TIMEOUT_MIN", "60"))
 
+# The global APScheduler instance
+scheduler = BackgroundScheduler()
+
 
 def run_pipeline_cycle():
-    """
-    Execute one full pipeline cycle:
-    Fetch → Filter → Score → Generate → Telegram → Wait for Approval
-    """
+    """Execute one full pipeline cycle."""
     log.info("=" * 50)
     log.info("PIPELINE CYCLE START")
     log.info(f"Interval: every {PIPELINE_INTERVAL_HOURS} hours")
     log.info("=" * 50)
 
     try:
-        # Step 1: Check LLM engine health
+        # Step 1: Check LLM health
         status = get_engine_status()
         available = sum(1 for v in status.values() if v.get("available"))
         if available == 0:
@@ -64,123 +54,117 @@ def run_pipeline_cycle():
             log_pipeline_run(0, 0, 0, "no_llm")
             return
 
-        log.info(f"LLM engines online: {available}/3")
-
         # Step 2: Fetch news
-        log.info("[1/5] Fetching trending topics...")
         topics = fetch_all_news(max_per_feed=MAX_PER_FEED)
         if not topics:
-            log.warning("No fresh topics found. Skipping cycle.")
+            log.warning("No fresh topics found.")
             log_pipeline_run(0, 0, 0, "no_topics")
             return
 
-        log.info(f"Found {len(topics)} fresh topics")
-
         # Step 3: Filter & Score
-        log.info("[2/5] Filtering and scoring...")
         scored = filter_and_score(topics, min_score=MIN_VIRALITY_SCORE)
         if not scored:
-            log.warning(f"No topics passed the {MIN_VIRALITY_SCORE} threshold. Skipping.")
+            log.warning(f"No topics passed score {MIN_VIRALITY_SCORE}.")
             log_pipeline_run(len(topics), 0, 0, "below_threshold")
             return
 
-        # Step 4: Generate posts for best topic
+        # Step 4: Generate
         best = scored[0]
-        log.info(f"[3/5] Best topic: {best['title'][:50]}... (Score: {best['score']})")
-        log.info("Generating 4 viral-angle posts...")
         posts = generate_posts(best["title"], best["summary"])
-
         if not posts:
-            log.error("Post generation failed. Skipping cycle.")
+            log.error("Post generation failed.")
             log_pipeline_run(len(topics), len(scored), 0, "gen_failed")
             return
 
-        log.info(f"Generated {len(posts)} posts")
-
         # Step 5: Send to Telegram
-        log.info("[4/5] Sending posts to Telegram...")
         for p in posts:
             send_post(p["post_number"], p["angle"], best["title"], p["text"])
             time.sleep(0.5)
 
         if not send_approval_buttons(best["title"], len(posts)):
-            log.error("Failed to send approval buttons")
+            log.error("Failed to send buttons.")
             log_pipeline_run(len(topics), len(scored), len(posts), "telegram_failed")
             return
 
-        # Step 6: Wait for approval
-        log.info(f"[5/5] Waiting for approval (timeout: {APPROVAL_TIMEOUT_MIN} min)...")
+        # Step 6: Wait Approval
         selected = wait_for_approval(timeout_minutes=APPROVAL_TIMEOUT_MIN)
 
         if selected and selected > 0:
-            chosen = posts[selected - 1]
-            log.info(f"POST {selected} ({chosen['angle']}) APPROVED!")
             mark_processed(best["title"], score=best["score"], approved=True)
             log_pipeline_run(len(topics), len(scored), len(posts), "approved")
-
         elif selected == -1:
-            log.info("All posts REJECTED by user")
             mark_processed(best["title"], score=best["score"], approved=False)
             log_pipeline_run(len(topics), len(scored), len(posts), "rejected")
-
         else:
-            log.warning("Approval TIMED OUT")
             mark_processed(best["title"], score=best["score"], approved=False)
             log_pipeline_run(len(topics), len(scored), len(posts), "timeout")
 
     except Exception as e:
-        log.error(f"Pipeline cycle CRASHED: {e}", exc_info=True)
-        log_pipeline_run(0, 0, 0, f"crash: {str(e)[:100]}")
+        log.error(f"Pipeline crashed: {e}")
+        log_pipeline_run(0, 0, 0, f"crash: {str(e)[:50]}")
 
-    log.info("=" * 50)
     log.info("PIPELINE CYCLE COMPLETE")
-    log.info(f"Next run in {PIPELINE_INTERVAL_HOURS} hours")
-    log.info("=" * 50)
 
 
-def main():
-    """Start the autonomous scheduler."""
-    log.info("=" * 55)
-    log.info("  SOCIAL MEDIA AGENCY — AUTONOMOUS SCHEDULER")
-    log.info(f"  Version: 6.1.0")
-    log.info(f"  Schedule: Every {PIPELINE_INTERVAL_HOURS} hours")
-    log.info(f"  Approval timeout: {APPROVAL_TIMEOUT_MIN} min")
-    log.info("=" * 55)
-
-    # Run first cycle immediately
-    log.info("Running first cycle immediately...")
-    run_pipeline_cycle()
-
-    # Schedule recurring runs
-    scheduler = BlockingScheduler()
+# ============================================================
+# FASTAPI APP
+# ============================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- Startup ---
+    log.info(f"Starting APScheduler (Interval: {PIPELINE_INTERVAL_HOURS}h)...")
+    
+    # Add the job
     scheduler.add_job(
         run_pipeline_cycle,
         trigger=IntervalTrigger(hours=PIPELINE_INTERVAL_HOURS),
         id="pipeline_cycle",
-        name="Agency Pipeline Cycle",
-        max_instances=1,                # Prevent overlapping runs
+        name="Agency Pipeline",
+        max_instances=1,
         replace_existing=True,
-        misfire_grace_time=3600,         # Allow 1 hour grace if a cycle is missed
     )
+    
+    # Start the scheduler
+    scheduler.start()
+    
+    # Run the very first cycle immediately (non-blocking)
+    scheduler.add_job(run_pipeline_cycle, id="initial_run", replace_existing=True)
+    
+    yield
+    
+    # --- Shutdown ---
+    log.info("Shutting down APScheduler...")
+    scheduler.shutdown()
 
-    # Graceful shutdown
-    def shutdown(signum, frame):
-        log.info("Shutdown signal received. Stopping scheduler...")
-        scheduler.shutdown(wait=False)
-        log.info("Scheduler stopped. Goodbye!")
-        sys.exit(0)
+app = FastAPI(title="Social Media Agency", lifespan=lifespan)
 
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
+@app.get("/")
+def ping_keepalive():
+    """
+    Endpoint for cron-job.org to ping.
+    Returns a simple 200 OK HTML response.
+    """
+    html_content = """
+    <html>
+        <head><title>Agency Status</title></head>
+        <body style="font-family: sans-serif; padding: 2rem; background: #1a1a1a; color: #fff;">
+            <h2>🟢 AI Agency is Online</h2>
+            <p>Running 24/7 via Hugging Face Spaces.</p>
+        </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
-    log.info(f"Scheduler started. Next cycle in {PIPELINE_INTERVAL_HOURS} hours.")
-    log.info("Press Ctrl+C to stop.\n")
-
-    try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        log.info("Scheduler stopped.")
-
+@app.get("/status")
+def status_check():
+    """Detailed health check for the agency."""
+    return {
+        "status": "online",
+        "llm_engine": get_engine_status(),
+        "pipeline_stats": get_stats()
+    }
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    # When running locally via CLI
+    uvicorn.run("scheduler:app", host="0.0.0.0", port=7860, reload=False)
